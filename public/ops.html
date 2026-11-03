@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PredictPool — Operations portal</title>
+<link rel="stylesheet" href="/styles.css">
+<style> header.top { background: #20352d; } .acts { display: flex; gap: 6px; flex-wrap: wrap; } .acts .btn { white-space: nowrap; } </style>
+</head>
+<body>
+<header class="top">
+  <span class="brand">PredictPool · Operations</span>
+  <nav id="nav"></nav><span class="spacer"></span><span id="who" class="small"></span>
+</header>
+<div class="sim-banner">Simulated funds. Every action here is written to the immutable, hash-chained audit log.</div>
+<main id="app"></main>
+<div id="toast"></div>
+<script>
+'use strict';
+const S = { token: null, admin: null, data: null, tab: 'pools' };
+try { S.token = sessionStorage.getItem('pp_ops'); } catch (_) {}
+const $ = (s) => document.querySelector(s);
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const money = (m, cur = 'USD') => { const neg = m < 0; const s = String(Math.abs(Number(m))).padStart(3, '0'); return `${neg ? '−' : ''}${cur} ${s.slice(0, -2).replace(/\B(?=(\d{3})+(?!\d))/g, ',')}.${s.slice(-2)}`; };
+const when = (d) => d ? new Date(d).toLocaleString(undefined, { dateStyle: 'short', timeStyle: 'medium' }) : '—';
+function toast(msg, bad) { const t = $('#toast'); t.textContent = msg; t.className = 'show' + (bad ? ' bad' : ''); clearTimeout(t._h); t._h = setTimeout(() => (t.className = ''), 3800); }
+async function api(method, path, body) {
+  const h = { 'content-type': 'application/json' }; if (S.token) h.authorization = 'Bearer ' + S.token;
+  const r = await fetch('/api' + path, { method, headers: h, body: body ? JSON.stringify(body) : undefined });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) { const e = new Error((j.error && j.error.message) || r.statusText); e.status = r.status; throw e; }
+  return j;
+}
+async function act(label, fn) { try { const r = await fn(); toast(label + ' ✓'); await load(); return r; } catch (e) { toast(e.message, true); } }
+
+function loginView() {
+  $('#nav').innerHTML = ''; $('#who').textContent = '';
+  $('#app').innerHTML = `<div class="card" style="max-width:440px"><h1>Administrator sign-in</h1><div class="form">
+    <label>Email</label><input id="ae" value="ops@demo.test"><label>Password</label><input id="ap" type="password" value="demo-password">
+    <label>Authenticator code (MFA)</label><div class="row"><input id="at" inputmode="numeric" maxlength="6" style="max-width:140px">
+    <button class="btn ghost sm" onclick="demoCode()">Demo authenticator</button></div>
+    <div class="row" style="margin-top:12px"><button class="btn" onclick="login()">Sign in</button></div>
+    <p class="small muted">MFA is mandatory for every administrator. The demo authenticator stands in for a phone app and is disabled outside demo mode.</p></div></div>`;
+}
+async function demoCode() { try { $('#at').value = (await api('GET', '/demo/totp/' + encodeURIComponent($('#ae').value))).code; } catch (e) { toast(e.message, true); } }
+async function login() {
+  try { const r = await api('POST', '/admin/auth/login', { email: $('#ae').value, password: $('#ap').value, totpCode: $('#at').value });
+    S.token = r.token; try { sessionStorage.setItem('pp_ops', r.token); } catch (_) {} await boot(); } catch (e) { toast(e.message, true); }
+}
+function logout() { S.token = null; try { sessionStorage.removeItem('pp_ops'); } catch (_) {} loginView(); }
+
+const TABS = [['pools', 'Pools'], ['create', 'Create'], ['results', 'Results & disputes'], ['money', 'Withdrawals'], ['recon', 'Reconciliation'], ['audit', 'Audit']];
+function nav() {
+  $('#nav').innerHTML = TABS.map(([k, l]) => `<button class="${S.tab === k ? 'active' : ''}" onclick="S.tab='${k}';render()">${l}</button>`).join('');
+  $('#who').innerHTML = `${esc(S.admin.display_name)} · ${S.admin.roles.join(', ')} <button class="btn ghost sm" style="color:#fff;border-color:#4b5d55;margin-left:8px" onclick="logout()">Sign out</button>`;
+}
+async function load() { S.data = await api('GET', '/admin/overview'); render(); }
+async function boot() { try { S.admin = await api('GET', '/admin/me'); await load(); } catch (e) { if (e.status === 401) loginView(); else toast(e.message, true); } }
+
+function render() {
+  nav();
+  const v = { pools: poolsView, create: createView, results: resultsView, money: moneyView, recon: reconView, audit: auditView }[S.tab];
+  Promise.resolve(v()).catch((e) => toast(e.message, true));
+}
+
+function poolsView() {
+  const d = S.data;
+  const tot = Object.fromEntries(d.totals.map((t) => [t.type, t.total]));
+  $('#app').innerHTML = `<div class="stats">
+    ${[['Customer available', tot.USER_AVAILABLE], ['Locked deposits', tot.USER_LOCKED], ['Prize escrow', tot.POOL_PRIZE_ESCROW], ['Fee revenue', tot.FEE_REVENUE], ['Pending withdrawals', tot.USER_PENDING_WITHDRAWAL], ['Sponsor balances', tot.SPONSOR_AVAILABLE]]
+      .map(([l, v]) => `<div class="card"><div class="small muted">${l}</div><div class="stat">${money(v || 0)}</div></div>`).join('')}</div>
+  <div class="card scroll" style="margin-top:14px"><h2>Pools</h2><table><tr><th>Pool</th><th>Status</th><th class="num">Entries</th><th class="num">Locked</th><th class="num">Prize escrow / budget</th><th>Actions</th></tr>
+  ${d.pools.map((p) => {
+    const funded = p.escrow_minor >= p.prize_budget_minor; const a = [];
+    if (p.status === 'DRAFT') { if (!funded) a.push(`<button class="btn sm secondary" onclick="act('Prize funded',()=>api('POST','/admin/pools/${p.id}/fund-prize'))">Fund prize</button>`);
+      a.push(`<button class="btn sm" ${funded ? '' : 'disabled title="Prize funding not confirmed"'} onclick="act('Pool opened',()=>api('POST','/admin/pools/${p.id}/open'))">Open</button>`); }
+    if (['OPEN', 'LOCKED'].includes(p.status)) a.push(`<button class="btn sm secondary" onclick="S.tab='results';render()">Result…</button>`);
+    if (p.status === 'RESULT_REVIEW') a.push(`<button class="btn sm" onclick="act('Result confirmed',()=>api('POST','/admin/pools/${p.id}/confirm-result'))">Confirm result</button>`);
+    if (['RESULT_CONFIRMED', 'CANCELLED', 'SETTLING'].includes(p.status)) a.push(`<button class="btn sm" onclick="previewSettle('${p.id}')">Preview & settle</button>`);
+    if (['SETTLED', 'REFUNDED'].includes(p.status)) a.push(`<button class="btn sm ghost" onclick="previewSettle('${p.id}', true)">Statement</button>`);
+    if (['DRAFT', 'OPEN', 'LOCKED', 'RESULT_REVIEW', 'DISPUTED', 'RESULT_CONFIRMED'].includes(p.status)) a.push(`<button class="btn sm ghost" onclick="cancelPool('${p.id}')">Cancel</button>`);
+    return `<tr><td><b>${esc(p.name)}</b><div class="small muted">${esc(p.event_name)} · deadline ${when(p.entry_deadline)}</div>
+      <div class="small muted">deposit ${money(p.entry_amount_minor)} · fee ${money(p.fee_minor)} (${p.fee_bps / 100}%) · ${esc(p.rules_version)}</div></td>
+      <td><span class="pill ${p.status}">${p.status}</span>${p.settlement_outcome ? `<div class="small muted">${p.settlement_outcome}</div>` : ''}</td>
+      <td class="num">${p.entry_count}</td><td class="num money">${money(p.locked_minor)}</td>
+      <td class="num money">${money(p.escrow_minor)} / ${money(p.prize_budget_minor)} ${p.status === 'DRAFT' ? `<div><span class="pill ${funded ? 'ok' : 'bad'}">${funded ? 'funding confirmed' : 'not funded'}</span></div>` : ''}</td>
+      <td><div class="acts">${a.join('')}</div></td></tr>`; }).join('')}</table></div>`;
+}
+async function cancelPool(id) { const reason = prompt('Cancellation reason (all deposits are refunded in full, no fee):', 'Event cancelled by organiser'); if (reason) act('Pool cancelled', () => api('POST', `/admin/pools/${id}/cancel`, { reason })); }
+
+async function previewSettle(id, readOnly) {
+  try {
+    const p = await api('GET', `/admin/pools/${id}/settlement-preview`); const t = p.totals;
+    const bg = document.createElement('div'); bg.className = 'modal-bg';
+    bg.innerHTML = `<div class="modal" style="max-width:760px"><h2>${p.persisted ? 'Settlement run' : 'Settlement preview'} — ${esc(p.mode)}</h2>
+      <div class="notice ${p.mode === 'PAYOUT' ? 'ok' : 'info'}">${esc(p.reason)}</div>
+      <div class="kv"><div>Entries / correct</div><div>${t.entries} / ${t.correct}</div><div>Deposits held</div><div>${money(t.depositsMinor)}</div>
+      <div>Fees to platform</div><div>${money(t.feesMinor)}</div><div>Deposits returned</div><div>${money(t.refundsMinor)}</div>
+      <div>Prize budget</div><div>${money(t.prizeBudgetMinor)}</div><div>Bonus allocated</div><div>${money(t.bonusGrossMinor)}</div>
+      <div>Withholding</div><div>${money(t.withholdingMinor)}</div><div>Returned to funder (remainder)</div><div>${money(t.prizeReturnedToFunderMinor)}</div>
+      <div class="total">Check: deposits + prize</div><div class="total">${money(t.depositsMinor + t.prizeBudgetMinor)}</div>
+      <div class="total">= credits + fees + withholding + remainder</div><div class="total">${money(t.netCreditsMinor + t.feesMinor + t.withholdingMinor + t.prizeReturnedToFunderMinor)}</div></div>
+      <div class="scroll" style="margin-top:10px;max-height:240px"><table><tr><th>Entry</th><th>Correct</th><th class="num">Fee</th><th class="num">Refund</th><th class="num">Bonus</th><th class="num">Net</th></tr>
+      ${p.lines.map((l) => `<tr><td class="mono">${esc(l.entryId.slice(0, 8))}</td><td>${l.isCorrect ? '✓' : ''}</td><td class="num">${money(l.feeMinor)}</td><td class="num">${money(l.refundMinor)}</td><td class="num">${money(l.bonusGrossMinor)}</td><td class="num">${money(l.netCreditMinor)}</td></tr>`).join('')}</table></div>
+      <div class="row" style="margin-top:14px">${readOnly || (p.run && p.run.status === 'COMPLETED') ? '' : '<button class="btn" id="go">Execute settlement</button>'}<button class="btn ghost" id="x">Close</button></div></div>`;
+    document.body.appendChild(bg); bg.querySelector('#x').onclick = () => bg.remove();
+    const go = bg.querySelector('#go'); if (go) go.onclick = async () => { go.disabled = true; await act('Settlement executed', () => api('POST', `/admin/pools/${id}/settle`)); bg.remove(); };
+  } catch (e) { toast(e.message, true); }
+}
+
+function createView() {
+  const d = S.data; const inH = (h) => new Date(Date.now() + h * 3.6e6).toISOString().slice(0, 16);
+  $('#app').innerHTML = `<div class="grid">
+  <div class="card"><h2>1 · Prize funder</h2><div class="form"><label>Name</label><input id="sn" placeholder="Sponsor or operator name">
+    <label>Type</label><select id="sk"><option>SPONSOR</option><option>OPERATOR</option></select>
+    <button class="btn secondary" style="margin-top:10px" onclick="act('Funder created',()=>api('POST','/admin/sponsors',{name:$('#sn').value,kind:$('#sk').value}))">Create funder</button></div></div>
+  <div class="card"><h2>2 · Event</h2><div class="form"><label>Name</label><input id="en" placeholder="Team A vs Team B">
+    <label>Kind</label><select id="ek"><option>MATCH</option><option>TOURNAMENT</option></select><label>Sport</label><input id="es" value="Football">
+    <label>Starts at</label><input id="et" type="datetime-local" value="${inH(24)}">
+    <label>Selections (one per line, CODE: Label)</label><textarea id="esel" rows="3">HOME: Home team\nAWAY: Away team</textarea>
+    <label>Official source reference</label><input id="eref" value="mock-${Date.now().toString(36)}">
+    <button class="btn secondary" style="margin-top:10px" onclick="createEvent()">Create event</button></div></div>
+  <div class="card"><h2>3 · Pool</h2><div class="form"><label>Event</label><select id="pe">${d.events.map((e) => `<option value="${e.id}">${esc(e.name)}</option>`)}</select>
+    <label>Pool name</label><input id="pn" placeholder="Match Winner Pool"><label>Entry deposit</label><input id="pd" value="10.00">
+    <label>Platform fee (% of deposit, rounded half-up to the cent)</label><input id="pf" value="5">
+    <label>Prize budget (separately funded)</label><input id="pp" value="100.00">
+    <label>Prize funder</label><select id="ps">${d.sponsors.map((s) => `<option value="${s.id}">${esc(s.name)} (${s.kind})</option>`)}</select>
+    <label>Entry deadline</label><input id="pt" type="datetime-local" value="${inH(23)}">
+    <button class="btn" style="margin-top:10px" onclick="createPool()">Create draft pool</button>
+    <p class="small muted">Terms freeze when the pool opens. Opening requires confirmed prize funding in escrow.</p></div></div></div>`;
+}
+const cents = (v) => Math.round(Number(v) * 100);
+function createEvent() {
+  const selections = $('#esel').value.split('\n').map((l) => l.split(':')).filter((x) => x[0].trim()).map(([c, ...l]) => ({ code: c.trim().toUpperCase(), label: (l.join(':') || c).trim() }));
+  act('Event created', () => api('POST', '/admin/events', { name: $('#en').value, kind: $('#ek').value, sport: $('#es').value, startsAt: new Date($('#et').value).toISOString(), selections, sourceEventRef: $('#eref').value }));
+}
+function createPool() {
+  act('Draft pool created', () => api('POST', '/admin/pools', { eventId: $('#pe').value, name: $('#pn').value, entryAmountMinor: cents($('#pd').value),
+    feeBps: Math.round(Number($('#pf').value) * 100), prizeBudgetMinor: cents($('#pp').value), sponsorId: $('#ps').value, entryDeadline: new Date($('#pt').value).toISOString() }))
+    .then(() => { S.tab = 'pools'; render(); });
+}
+
+function resultsView() {
+  const d = S.data;
+  const evRows = d.events.map((e) => {
+    const ps = d.pools.filter((p) => p.event_id === e.id); const rs = d.results.filter((r) => r.event_id === e.id);
+    return `<tr><td><b>${esc(e.name)}</b><div class="small muted">${esc(e.official_source)} · ref ${esc(e.source_event_ref)}</div>
+      <div class="small">${ps.map((p) => `<span class="pill ${p.status}">${esc(p.name.slice(0, 22))}: ${p.status}</span>`).join(' ')}</div>
+      ${rs.map((r) => `<div class="small muted">v${r.version}: ${r.outcome_type}${r.winning_code ? ' ' + esc(r.winning_code) : ''} ${r.is_final ? '(final)' : '(provisional)'} · ${when(r.recorded_at)}</div>`).join('')}</td>
+      <td><div class="form" style="max-width:260px"><select id="o_${e.id}">${(e.selections || []).map((s) => `<option value="WINNER:${esc(s.code)}">Winner: ${esc(s.label)}</option>`).join('')}
+        <option value="TIE:">Tie / draw (unsupported)</option><option value="NO_RESULT:">No result</option></select>
+      <div class="acts"><button class="btn sm secondary" onclick="publish('${e.id}')">1 · Publish to mock feed</button>
+      <button class="btn sm" onclick="act('Result ingested',()=>api('POST','/admin/events/${e.id}/ingest-result'))">2 · Ingest official result</button>
+      <button class="btn sm ghost" onclick="postpone('${e.id}')">Postpone…</button></div></div></td></tr>`; }).join('');
+  $('#app').innerHTML = `<div class="card scroll"><h2>Official results</h2><p class="small muted">Step 1 simulates the official source publishing a result. Step 2 ingests it from the documented source into a new immutable result version. A new version before settlement is treated as a correction and returns pools to review.</p>
+    <table><tr><th>Event</th><th>Result actions</th></tr>${evRows}</table></div>
+    <div class="card scroll" style="margin-top:14px"><h2>Disputes</h2><table><tr><th>Pool</th><th>Reason</th><th>Status</th><th></th></tr>
+    ${d.disputes.map((x) => `<tr><td>${esc(x.pool_name)}<div class="small muted">${x.raised_by_type} · ${when(x.created_at)}</div></td><td>${esc(x.reason)}${x.resolution_note ? `<div class="small muted">→ ${esc(x.resolution_note)}</div>` : ''}</td>
+      <td><span class="pill ${x.status === 'OPEN' ? 'DISPUTED' : 'ok'}">${x.status}</span></td>
+      <td>${x.status === 'OPEN' ? `<div class="acts"><button class="btn sm" onclick="resolve('${x.id}','UPHELD')">Uphold</button><button class="btn sm ghost" onclick="resolve('${x.id}','REJECTED')">Reject</button></div>` : ''}</td></tr>`).join('') || '<tr><td colspan="4" class="muted">No disputes</td></tr>'}</table></div>`;
+}
+function publish(id) { const [outcomeType, winningCode] = $('#o_' + id).value.split(':'); act('Published to mock feed', () => api('POST', `/admin/events/${id}/feed-result`, { outcomeType, winningCode: winningCode || null, isFinal: true })); }
+function resolve(id, decision) { const note = prompt(`${decision} — resolution note:`, decision === 'UPHELD' ? 'Upheld; corrected official result to be ingested' : 'Official source confirms result'); if (note !== null) act('Dispute ' + decision.toLowerCase(), () => api('POST', `/admin/disputes/${id}/resolve`, { decision, note })); }
+function postpone(id) { const h = prompt('Postpone by how many hours from the original start? (pools cancel with full refunds beyond their window, default 72h)', '24'); if (h) {
+  const ev = S.data.events.find((e) => e.id === id); act('Postponement applied', () => api('POST', `/admin/events/${id}/postpone`, { newStartsAt: new Date(new Date(ev.original_starts_at).getTime() + Number(h) * 3.6e6).toISOString() })); } }
+
+function moneyView() {
+  const d = S.data;
+  $('#app').innerHTML = `<div class="card"><h2>Simulated payout provider</h2><p class="small muted">Inject provider behaviour to exercise failed-withdrawal handling. Current: <b>${esc(d.payoutMode)}</b></p>
+    <div class="acts">${['NORMAL', 'DECLINE', 'TIMEOUT', 'TIMEOUT_AFTER_COMMIT'].map((m) => `<button class="btn sm ${m === d.payoutMode ? '' : 'ghost'}" onclick="act('Payout mode ${m}',()=>api('POST','/admin/mock/payout-mode',{mode:'${m}'}))">${m}</button>`).join('')}
+    <button class="btn sm secondary" onclick="act('Worker tick',()=>api('POST','/admin/worker/tick'))">Run worker now</button></div>
+    <p class="small muted">Outbox: ${d.outbox.map((o) => `${o.status} ${o.n}`).join(' · ') || 'empty'}</p></div>
+    <div class="card scroll" style="margin-top:14px"><h2>Recent withdrawals</h2><table><tr><th>User</th><th>Requested</th><th>Status</th><th class="num">Attempts</th><th class="num">Amount</th></tr>
+    ${d.withdrawals.map((w) => `<tr><td>${esc(w.email)}</td><td>${when(w.created_at)}</td><td><span class="pill ${w.status}">${w.status}</span> <span class="small muted">${esc(w.failure_reason || '')}</span></td><td class="num">${w.attempts}</td><td class="num money">${money(w.amount_minor)}</td></tr>`).join('') || '<tr><td colspan="5" class="muted">None</td></tr>'}</table></div>`;
+}
+
+async function reconView() {
+  const r = await api('GET', '/admin/reconciliation');
+  $('#app').innerHTML = `<div class="cols"><div class="card"><h2>Ledger invariants <span class="pill ${r.invariants.ok ? 'ok' : 'bad'}">${r.invariants.ok ? 'all pass' : 'FAILING'}</span></h2>
+    <table>${r.invariants.checks.map((c) => `<tr><td>${c.ok ? '✔' : '✘'}</td><td>${esc(c.name)}${c.ok ? '' : `<div class="mono">${esc(JSON.stringify(c.detail))}</div>`}</td></tr>`).join('')}</table></div>
+  <div class="card"><h2>Provider reconciliation <span class="pill ${r.provider.ok ? 'ok' : 'bad'}">${r.provider.ok ? 'matched' : r.provider.issues.length + ' issues'}</span></h2>
+    <div class="kv"><div>Provider net (pay-ins − payouts)</div><div>${money(r.provider.providerNetMinor)}</div><div>Ledger clearing position</div><div>${money(r.provider.ledgerClearingMinor)}</div></div>
+    ${r.provider.issues.map((i) => `<div class="notice warn mono">${esc(JSON.stringify(i))}</div>`).join('')}</div></div>
+  <div class="card scroll" style="margin-top:14px"><h2>Account totals</h2><table><tr><th>Account type</th><th class="num">Balance</th></tr>
+    ${S.data.totals.map((t) => `<tr><td>${t.type}</td><td class="num money">${money(t.total)}</td></tr>`).join('')}</table>
+    <p class="small muted">Sign convention: liabilities and revenue are positive; PROVIDER_CLEARING mirrors cash held at the provider and is negative by the same total, so the ledger sums to zero.</p></div>`;
+}
+
+async function auditView() {
+  const rows = await api('GET', '/admin/audit?limit=300');
+  $('#app').innerHTML = `<div class="card scroll"><h2>Audit history</h2><p class="small muted">Append-only; each record carries the hash of the previous one. Update/delete is blocked in the database.</p>
+    <table><tr><th>#</th><th>When</th><th>Actor</th><th>Action</th><th>Target</th><th>Details</th><th>Hash</th></tr>
+    ${rows.map((r) => `<tr><td>${r.id}</td><td class="small">${when(r.at)}</td><td class="small">${r.actor_type}${r.actor_id ? ' ' + esc(r.actor_id.slice(0, 8)) : ''}</td><td><b>${esc(r.action)}</b></td>
+      <td class="small">${esc(r.target_type || '')} ${esc((r.target_id || '').slice(0, 8))}</td><td class="mono" style="max-width:320px;word-break:break-word">${esc(JSON.stringify(r.details)).slice(0, 220)}</td><td class="mono">${r.hash.slice(0, 10)}</td></tr>`).join('')}</table></div>`;
+}
+boot();
+</script>
+</body>
+</html>

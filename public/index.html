@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PredictPool — refundable prediction pools (demo)</title>
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<header class="top">
+  <span class="brand">PredictPool</span>
+  <nav id="nav"></nav>
+  <span class="spacer"></span>
+  <span id="who" class="small"></span>
+</header>
+<div class="sim-banner">Simulated funds only. Live payments are disabled until jurisdiction, provider approval, custody and tax rules are configured.</div>
+<main id="app"></main>
+<div id="toast"></div>
+<script>
+'use strict';
+const S = { token: null, cfg: null, me: null, skew: 0 };
+try { S.token = localStorage.getItem('pp_token'); } catch (_) {}
+const $ = (s) => document.querySelector(s);
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+function money(m, cur) {
+  cur = cur || (S.cfg && S.cfg.currency) || 'USD'; const e = (S.cfg && S.cfg.exponent) ?? 2;
+  const neg = m < 0; const s = String(Math.abs(m)).padStart(e + 1, '0');
+  return `${neg ? '−' : ''}${cur} ${s.slice(0, s.length - e).replace(/\B(?=(\d{3})+(?!\d))/g, ',')}${e ? '.' + s.slice(-e) : ''}`;
+}
+const toMinor = (v) => { const n = Number(String(v).replace(/,/g, '')); return Math.round(n * 10 ** ((S.cfg && S.cfg.exponent) ?? 2)); };
+const when = (d) => new Date(d).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
+function toast(msg, bad) { const t = $('#toast'); t.textContent = msg; t.className = 'show' + (bad ? ' bad' : ''); clearTimeout(t._h); t._h = setTimeout(() => (t.className = ''), 3500); }
+const uid = () => (crypto.randomUUID ? crypto.randomUUID() : String(Math.random()).slice(2));
+
+async function api(method, path, body, idemKey) {
+  const h = { 'content-type': 'application/json' };
+  if (S.token) h.authorization = 'Bearer ' + S.token;
+  if (idemKey) h['idempotency-key'] = idemKey;
+  const r = await fetch('/api' + path, { method, headers: h, body: body ? JSON.stringify(body) : undefined });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) { const e = new Error((j.error && j.error.message) || r.statusText); e.code = j.error && j.error.code; e.status = r.status; throw e; }
+  return j;
+}
+function setToken(t) { S.token = t; try { t ? localStorage.setItem('pp_token', t) : localStorage.removeItem('pp_token'); } catch (_) {} }
+
+async function refreshMe() {
+  if (!S.token) { S.me = null; return; }
+  try { S.me = await api('GET', '/me'); } catch (e) { if (e.status === 401) { setToken(null); S.me = null; } else throw e; }
+}
+function renderHeader() {
+  const route = location.hash.split('/')[1] || 'pools';
+  const items = S.me ? [['pools', 'Pools'], ['entries', 'My entries'], ['wallet', 'Wallet'], ['account', 'Account']] : [['pools', 'Pools'], ['login', 'Sign in']];
+  $('#nav').innerHTML = items.map(([k, l]) => `<button class="${route === k || (k === 'pools' && route === 'pool') ? 'active' : ''}" onclick="location.hash='#/${k}'">${l}</button>`).join('');
+  $('#who').innerHTML = S.me ? `${esc(S.me.profile.displayName)} · <span class="money">${money(S.me.balances.availableMinor)}</span> available
+    <button class="btn ghost sm" style="color:#fff;border-color:#555;margin-left:8px" onclick="logout()">Sign out</button>` : '';
+}
+function logout() { setToken(null); S.me = null; location.hash = '#/pools'; route(); }
+
+// ───────────────────────────── views
+async function viewLogin() {
+  $('#app').innerHTML = `<div class="cols"><div class="card"><h1>Sign in</h1>
+    <div class="form"><label>Email</label><input id="le" type="email" autocomplete="username">
+    <label>Password</label><input id="lp" type="password" autocomplete="current-password">
+    <div class="row" style="margin-top:10px"><button class="btn" onclick="doLogin()">Sign in</button></div></div></div>
+    <div class="card"><h2>New here?</h2><div class="form"><label>Name</label><input id="rn"><label>Email</label><input id="re" type="email">
+    <label>Password (8+ characters)</label><input id="rp" type="password" autocomplete="new-password">
+    <div class="row" style="margin-top:10px"><button class="btn secondary" onclick="doRegister()">Create account</button></div>
+    <p class="small muted">One entry per verified account per pool. You must pass identity and eligibility checks before funding.</p></div></div></div>`;
+}
+async function doLogin() {
+  try { const r = await api('POST', '/auth/login', { email: $('#le').value, password: $('#lp').value }); setToken(r.token); await refreshMe(); location.hash = S.me.profile.verificationStatus === 'VERIFIED' ? '#/pools' : '#/account'; }
+  catch (e) { toast(e.message, true); }
+}
+async function doRegister() {
+  try {
+    await api('POST', '/auth/register', { email: $('#re').value, password: $('#rp').value, displayName: $('#rn').value });
+    const r = await api('POST', '/auth/login', { email: $('#re').value, password: $('#rp').value }); setToken(r.token); await refreshMe();
+    toast('Account created — complete verification next'); location.hash = '#/account';
+  } catch (e) { toast(e.message, true); }
+}
+
+async function viewPools() {
+  const pools = await api('GET', '/pools');
+  const open = pools.filter((p) => p.status === 'OPEN'); const rest = pools.filter((p) => p.status !== 'OPEN');
+  const card = (p) => `<div class="card click" onclick="location.hash='#/pool/${p.id}'">
+    <div class="row between"><span class="pill">${p.event.kind === 'MATCH' ? 'Match' : 'Tournament'} · ${esc(p.event.sport)}</span><span class="pill ${p.status}">${p.status.replace('_', ' ')}</span></div>
+    <h3 style="margin-top:10px">${esc(p.name)}</h3><div class="small muted">${esc(p.event.name)}</div>
+    <div class="kv small" style="margin-top:10px"><div>Deposit</div><div>${money(p.disclosure.depositMinor, p.currency)}</div>
+    <div>Fee (you can lose this)</div><div>${money(p.disclosure.feeMinor, p.currency)}</div>
+    <div>Refundable after result</div><div>${money(p.disclosure.refundableMinor, p.currency)}</div>
+    <div>Funded prize budget</div><div>${money(p.disclosure.prizeBudgetMinor, p.currency)}</div></div>
+    <div class="small muted" style="margin-top:8px">Entries close ${when(p.entryDeadline)} · ${p.entries} entries${p.myEntry ? ' · <b>you’re in</b>' : ''}</div></div>`;
+  $('#app').innerHTML = `<h1>Open pools</h1>${open.length ? `<div class="grid">${open.map(card).join('')}</div>` : '<p class="muted">No pools are open right now.</p>'}
+    ${rest.length ? `<h2 style="margin-top:26px">Closed and settled</h2><div class="grid">${rest.map(card).join('')}</div>` : ''}`;
+}
+
+let pickId = null; let countdownTimer;
+async function viewPool(id) {
+  const p = await api('GET', '/pools/' + id);
+  S.skew = new Date(p.serverTime) - Date.now();
+  const d = p.disclosure; const mine = p.myEntry;
+  const winSel = p.selections.find((s) => s.id === p.winningSelectionId);
+  if (!mine) pickId = pickId && p.selections.some((s) => s.id === pickId) ? pickId : null;
+  const canEnter = p.status === 'OPEN' && !mine;
+  const sel = p.selections.find((s) => s.id === (mine ? mine.selectionId : pickId));
+  $('#app').innerHTML = `<p><a href="#/pools" class="small">← All pools</a></p>
+  <div class="cols"><div>
+    <div class="card"><div class="row between"><span class="pill">${p.event.kind === 'MATCH' ? 'Match winner' : 'Tournament winner'}</span><span class="pill ${p.status}">${p.status.replace('_', ' ')}</span></div>
+      <h1 style="margin-top:10px">${esc(p.name)}</h1>
+      <div class="muted">${esc(p.event.name)} · starts ${when(p.event.startsAt)}</div>
+      <div class="small muted">Official result source: ${esc(p.event.officialSource)}</div>
+      ${p.status === 'OPEN' ? `<div class="notice info">Entries close in <span class="countdown" id="cd"></span> (server time) — ${when(p.entryDeadline)}</div>` : ''}
+      ${winSel ? `<div class="notice ok">Official winner: <b>${esc(winSel.label)}</b></div>` : ''}
+      ${p.settlementReason ? `<div class="notice ${p.settlementOutcome === 'PAYOUT' ? 'ok' : 'info'}">${esc(p.settlementReason)}</div>` : ''}
+      <h2 style="margin-top:14px">${mine ? 'Your prediction' : 'Choose the winner'}</h2>
+      <div class="choices">${p.selections.map((s) => `<div class="choice ${(mine ? mine.selectionId : pickId) === s.id ? 'sel' : ''}" ${canEnter ? `onclick="pickId='${s.id}';viewPool('${p.id}')"` : ''}>
+        <div><b>${esc(s.label)}</b><div class="small muted">${s.picks} pick${s.picks === 1 ? '' : 's'} so far</div></div>
+        <div class="small" style="text-align:right">Est. bonus if correct<br><b class="money">≈ ${money(s.bonusEstimate.estimateGrossMinor, p.currency)}</b>
+        <div class="muted">max ${money(s.bonusEstimate.maximumGrossMinor, p.currency)}</div></div></div>`).join('')}</div>
+      <p class="small muted">Bonus figures are <b>estimates</b>: the funded budget is shared equally among everyone who picks the eventual winner, so the amount changes as others enter.</p>
+      ${canEnter ? (S.me ? `<button class="btn" ${pickId ? '' : 'disabled'} onclick="confirmEntry('${p.id}')">Review and confirm entry</button>` : '<a class="btn" href="#/login">Sign in to enter</a>') : ''}
+      ${mine ? `<div class="row" style="margin-top:12px"><a class="btn secondary" href="#/entries">View receipt${mine.status !== 'ACTIVE' ? ' & settlement' : ''}</a>
+        ${['RESULT_REVIEW', 'RESULT_CONFIRMED', 'DISPUTED'].includes(p.status) ? `<button class="btn ghost" onclick="dispute('${p.id}')">Dispute result</button>` : ''}</div>` : ''}
+    </div></div>
+    <div><div class="card"><h2>What you put in, what you get back</h2>
+      <div class="kv"><div>Deposit (locked until settlement)</div><div>${money(d.depositMinor, p.currency)}</div>
+      <div>Platform fee — ${d.feeBps / 100}% of deposit</div><div>−${money(d.feeMinor, p.currency)}</div>
+      <div class="total">Refundable to every participant</div><div class="total">${money(d.refundableMinor, p.currency)}</div>
+      <div>Prize budget (${d.prizeSource.toLowerCase()}-funded, confirmed)</div><div>${money(d.prizeBudgetMinor, p.currency)}</div>
+      <div>Withholding rule</div><div class="small">${d.withholdingRule === 'NONE_CONFIGURED' ? 'none configured' : esc(d.withholdingRule)}</div></div>
+      <div class="notice warn">${esc(d.youCanLose)}</div>
+      <p class="small muted">The prize budget is funded separately by the ${d.prizeSource.toLowerCase()} and held in escrow; it never comes from participants’ deposits. If the event is cancelled, ends in an unsupported tie, or nobody predicts correctly, every deposit is refunded in full with no fee.</p>
+      <details><summary>Settlement rules (${esc(p.rulesVersion)})</summary><ul class="rules">${p.settlementRules.map((r) => `<li>${esc(r)}</li>`).join('')}</ul>
+      <div class="mono muted">terms hash ${esc(p.termsHash)}</div></details></div></div></div>`;
+  clearInterval(countdownTimer);
+  if (p.status === 'OPEN') {
+    const tick = () => { const ms = new Date(p.entryDeadline) - (Date.now() + S.skew); const el = $('#cd'); if (!el) return clearInterval(countdownTimer);
+      if (ms <= 0) { el.textContent = 'closed'; return clearInterval(countdownTimer); }
+      const s = Math.floor(ms / 1000); el.textContent = `${Math.floor(s / 86400)}d ${Math.floor(s % 86400 / 3600)}h ${Math.floor(s % 3600 / 60)}m ${s % 60}s`; };
+    tick(); countdownTimer = setInterval(tick, 1000);
+  }
+}
+
+async function confirmEntry(poolId) {
+  const p = await api('GET', '/pools/' + poolId); const s = p.selections.find((x) => x.id === pickId); const d = p.disclosure;
+  if (S.me.profile.verificationStatus !== 'VERIFIED') { toast('Complete verification first', true); location.hash = '#/account'; return; }
+  const short = S.me.balances.availableMinor < d.depositMinor;
+  const key = uid();
+  const bg = document.createElement('div'); bg.className = 'modal-bg';
+  bg.innerHTML = `<div class="modal"><h2>Confirm your entry</h2>
+    <div class="kv"><div>Pool</div><div>${esc(p.name)}</div><div>Your pick</div><div><b>${esc(s.label)}</b></div>
+    <div>Deposit locked now</div><div>${money(d.depositMinor, p.currency)}</div><div>Fee kept by platform</div><div>−${money(d.feeMinor, p.currency)}</div>
+    <div>Returned after result</div><div>${money(d.refundableMinor, p.currency)}</div>
+    <div>Estimated bonus if correct</div><div>≈ ${money(s.bonusEstimate.estimateGrossMinor, p.currency)} <span class="small muted">(estimate)</span></div></div>
+    <div class="notice warn">If your pick is wrong you get ${money(d.refundableMinor, p.currency)} back and lose the ${money(d.feeMinor, p.currency)} fee. No profit is guaranteed.</div>
+    ${short ? `<div class="notice bad">Your available balance (${money(S.me.balances.availableMinor)}) is below the deposit. Add funds in Wallet.</div>` : ''}
+    <label class="row" style="color:var(--ink)"><input type="checkbox" id="agree" style="width:auto"> I accept settlement rules ${esc(p.rulesVersion)}.</label>
+    <div class="row" style="margin-top:12px"><button class="btn" id="go" ${short ? 'disabled' : ''}>Confirm entry</button><button class="btn ghost" id="cancel">Cancel</button></div></div>`;
+  document.body.appendChild(bg);
+  bg.querySelector('#cancel').onclick = () => bg.remove();
+  bg.querySelector('#go').onclick = async () => {
+    if (!bg.querySelector('#agree').checked) return toast('Please accept the settlement rules', true);
+    bg.querySelector('#go').disabled = true;
+    try {
+      const r = await api('POST', `/pools/${poolId}/entries`, { selectionId: pickId, acceptedRulesVersion: p.rulesVersion, acceptedTermsHash: p.termsHash }, key);
+      bg.remove(); await refreshMe(); renderHeader(); showReceipt(r);
+    } catch (e) { toast(e.message, true); bg.querySelector('#go').disabled = false; }
+  };
+}
+function receiptHtml(r) {
+  return `<div class="kv"><div>Receipt</div><div class="mono">${esc(r.receiptId)}</div><div>Pool</div><div>${esc(r.poolName)}</div>
+    <div>Selection</div><div><b>${esc(r.selection.label)}</b></div><div>Deposit</div><div>${money(r.depositMinor, r.currency)}</div>
+    <div>Fee</div><div>${money(r.feeMinor, r.currency)}</div><div>Refundable</div><div>${money(r.refundableMinor, r.currency)}</div>
+    <div>Accepted (server time)</div><div>${new Date(r.acceptedAt).toISOString().replace('T', ' ').slice(0, 23)} UTC</div>
+    <div>Rule version</div><div>${esc(r.rulesVersion)}</div><div>Terms hash</div><div class="mono">${esc(r.termsHash.slice(0, 16))}…</div>
+    <div>Ledger transaction</div><div class="mono">${esc(r.ledgerTransactionId.slice(0, 8))}</div><div>Funds</div><div>${esc(r.fundsMode)}</div></div>`;
+}
+function modal(html) { const bg = document.createElement('div'); bg.className = 'modal-bg'; bg.innerHTML = `<div class="modal">${html}<div class="row" style="margin-top:14px"><button class="btn ghost">Close</button></div></div>`; bg.querySelector('button.ghost').onclick = () => bg.remove(); document.body.appendChild(bg); }
+function showReceipt(r) { modal(`<h2>Entry confirmed</h2>${receiptHtml(r)}`); }
+async function openReceipt(id) { showReceipt(await api('GET', `/entries/${id}/receipt`)); }
+async function openStatement(id) {
+  const s = await api('GET', `/entries/${id}/settlement`);
+  modal(`<h2>Settlement statement</h2><div class="small muted">${esc(s.poolName)} · your pick: ${esc(s.selection)} · ${s.isCorrect ? 'correct' : 'not correct'}</div>
+    <div class="notice ${s.outcome === 'PAYOUT' ? 'ok' : 'info'}">${esc(s.reason)}</div>
+    <div class="kv">${s.items.map((i) => `<div class="${i.total ? 'total' : ''}">${esc(i.label)}</div><div class="${i.total ? 'total' : ''}">${money(i.amountMinor, s.currency)}</div>`).join('')}</div>
+    <p class="small muted">Settled ${when(s.settledAt)} · ledger txn <span class="mono">${esc(String(s.ledgerTransactionId).slice(0, 8))}</span></p>`);
+}
+async function dispute(poolId) {
+  const reason = prompt('Describe the problem with the result (it will be reviewed before settlement):');
+  if (!reason) return;
+  try { await api('POST', `/pools/${poolId}/disputes`, { reason }); toast('Dispute submitted — settlement is on hold'); viewPool(poolId); } catch (e) { toast(e.message, true); }
+}
+
+async function viewEntries() {
+  const es = await api('GET', '/me/entries');
+  $('#app').innerHTML = `<h1>My entries</h1><div class="card scroll">${es.length ? `<table><tr><th>Pool</th><th>Pick</th><th>Status</th><th class="num">Locked</th><th class="num">Net credit</th><th></th></tr>
+    ${es.map((e) => `<tr><td><a href="#/pool/${e.poolId}">${esc(e.poolName)}</a><div class="small muted">${when(e.acceptedAt)}</div></td><td>${esc(e.selection)}${e.isCorrect ? ' ✓' : ''}</td>
+    <td><span class="pill ${e.poolStatus}">${e.poolStatus.replace('_', ' ')}</span></td>
+    <td class="num money">${e.status === 'ACTIVE' ? money(e.depositMinor, e.currency) : '—'}</td>
+    <td class="num money">${e.settled ? money(e.netCreditMinor, e.currency) : '<span class="muted">pending</span>'}</td>
+    <td class="num"><button class="btn ghost sm" onclick="openReceipt('${e.entryId}')">Receipt</button> ${e.settled ? `<button class="btn sm" onclick="openStatement('${e.entryId}')">Statement</button>` : ''}</td></tr>`).join('')}</table>` : '<p class="muted">No entries yet.</p>'}</div>`;
+}
+
+async function viewWallet() {
+  await refreshMe(); renderHeader();
+  const b = S.me.balances; const [tx, wd] = await Promise.all([api('GET', '/wallet/transactions'), api('GET', '/wallet/withdrawals')]);
+  $('#app').innerHTML = `<h1>Wallet</h1>
+  <div class="stats"><div class="card"><div class="small muted">Available</div><div class="stat">${money(b.availableMinor)}</div></div>
+    <div class="card"><div class="small muted">Locked in pools</div><div class="stat">${money(b.lockedMinor)}</div></div>
+    <div class="card"><div class="small muted">Pending withdrawal</div><div class="stat">${money(b.pendingWithdrawalMinor)}</div></div></div>
+  <div class="cols" style="margin-top:14px"><div class="card"><h2>Add funds (simulated)</h2>
+      <div class="row"><input id="damt" value="20.00" style="max-width:140px" inputmode="decimal"><button class="btn" onclick="deposit()">Deposit</button></div>
+      <p class="small muted">Creates a pending deposit, completes a simulated checkout, and credits your balance only when the signed provider callback arrives.</p></div>
+    <div class="card"><h2>Withdraw (simulated)</h2>
+      <div class="row"><input id="wamt" value="${(b.availableMinor / 100).toFixed(2)}" style="max-width:140px" inputmode="decimal"><button class="btn secondary" onclick="withdraw()">Withdraw</button></div>
+      <p class="small muted">Withdrawals are processed separately from pool settlement. Failed payouts return to your available balance.</p></div></div>
+  ${wd.length ? `<div class="card" style="margin-top:14px"><h2>Withdrawals</h2><table><tr><th>Requested</th><th>Status</th><th class="num">Amount</th></tr>
+    ${wd.map((w) => `<tr><td>${when(w.createdAt)}</td><td><span class="pill ${w.status}">${w.status}</span> ${w.failureReason ? `<span class="small muted">${esc(w.failureReason)}</span>` : ''}</td><td class="num money">${money(w.amountMinor)}</td></tr>`).join('')}</table></div>` : ''}
+  <div class="card scroll" style="margin-top:14px"><h2>Transaction history</h2><table><tr><th>When</th><th>Type</th><th>Balance</th><th class="num">Amount</th></tr>
+    ${tx.map((t) => `<tr><td class="small">${when(t.at)}</td><td>${esc(t.type.replace(/_/g, ' ').toLowerCase())}<div class="small muted">${esc(t.description)}</div></td>
+    <td class="small">${esc(t.account.replace('USER_', '').replace('_', ' ').toLowerCase())}</td><td class="num money">${money(t.amountMinor)}</td></tr>`).join('') || '<tr><td colspan="4" class="muted">No transactions yet</td></tr>'}</table></div>`;
+}
+async function deposit() {
+  try {
+    const d = await api('POST', '/wallet/deposits', { amountMinor: toMinor($('#damt').value) }, uid());
+    const r = await api('POST', `/wallet/deposits/${d.depositId}/simulate-checkout`, {});
+    toast(r.status === 'credited' ? 'Deposit credited' : `Deposit ${r.status}`); viewWallet();
+  } catch (e) { toast(e.message, true); }
+}
+async function withdraw() {
+  try { await api('POST', '/wallet/withdrawals', { amountMinor: toMinor($('#wamt').value) }, uid()); toast('Withdrawal requested'); setTimeout(viewWallet, 1200); viewWallet(); }
+  catch (e) { toast(e.message, true); }
+}
+
+async function viewAccount() {
+  await refreshMe(); renderHeader(); const p = S.me.profile;
+  $('#app').innerHTML = `<h1>Account</h1><div class="cols"><div class="card"><h2>Identity & eligibility</h2>
+    <p>Status: <span class="pill ${p.verificationStatus}">${p.verificationStatus}</span> ${p.documentMasked ? `<span class="small muted">document ${esc(p.documentMasked)}</span>` : ''}</p>
+    ${p.verificationStatus !== 'VERIFIED' ? `<div class="form"><label>Full legal name</label><input id="vn" value="${esc(p.displayName)}">
+      <label>Date of birth</label><input id="vd" type="date" value="1990-01-01"><label>ID document number</label><input id="vdoc" value="P${Math.floor(Math.random() * 1e7)}">
+      <label>Jurisdiction</label><select id="vj"><option value="DEMO">DEMO (simulated eligible region)</option><option value="OTHER">Other (not eligible)</option></select>
+      <div class="row" style="margin-top:10px"><button class="btn" onclick="verify()">Submit for verification</button></div>
+      <p class="small muted">Simulated provider. Identity data is encrypted at rest; staff see only a masked document number.</p></div>` : '<p class="small muted">You can fund your account and enter pools.</p>'}
+  </div><div class="card"><h2>Limits & self-exclusion</h2>
+    <label>Daily deposit limit</label><div class="row"><input id="lim" value="${((p.dailyDepositLimitMinor || 0) / 100).toFixed(2)}" style="max-width:140px"><button class="btn secondary" onclick="setLimit()">Save</button></div>
+    <label style="margin-top:16px">Self-exclusion</label>
+    ${p.selfExcludedUntil && new Date(p.selfExcludedUntil) > new Date() ? `<div class="notice warn">Self-excluded until ${when(p.selfExcludedUntil)}. You can still withdraw.</div>` : ''}
+    <div class="row"><select id="sx" style="max-width:160px"><option value="1">24 hours</option><option value="7">7 days</option><option value="30">30 days</option><option value="180">6 months</option></select>
+      <button class="btn danger" onclick="exclude()">Self-exclude</button></div>
+    <p class="small muted">Blocks deposits and new entries for the period. It cannot be shortened once set.</p></div></div>`;
+}
+async function verify() {
+  try { const r = await api('POST', '/me/verification', { fullName: $('#vn').value, dateOfBirth: $('#vd').value, documentNumber: $('#vdoc').value, jurisdiction: $('#vj').value });
+    toast(r.status === 'VERIFIED' ? 'Verified' : 'Not eligible: ' + r.reasons.join(', '), r.status !== 'VERIFIED'); viewAccount(); } catch (e) { toast(e.message, true); }
+}
+async function setLimit() { try { await api('PUT', '/me/limits', { dailyDepositLimitMinor: toMinor($('#lim').value) }); toast('Limit saved'); } catch (e) { toast(e.message, true); } }
+async function exclude() { if (!confirm('Self-exclude? This cannot be undone early.')) return; try { await api('POST', '/me/self-exclusion', { days: Number($('#sx').value) }); viewAccount(); } catch (e) { toast(e.message, true); } }
+
+async function route() {
+  const [, r, id] = location.hash.split('/');
+  try {
+    if (!S.cfg) S.cfg = await api('GET', '/config');
+    await refreshMe(); renderHeader();
+    if (['entries', 'wallet', 'account'].includes(r) && !S.me) return viewLogin();
+    if (r === 'login') return viewLogin();
+    if (r === 'pool') return viewPool(id);
+    if (r === 'entries') return viewEntries();
+    if (r === 'wallet') return viewWallet();
+    if (r === 'account') return viewAccount();
+    return viewPools();
+  } catch (e) { $('#app').innerHTML = `<div class="notice bad">${esc(e.message)}</div>`; }
+}
+window.addEventListener('hashchange', () => { pickId = null; document.querySelectorAll('.modal-bg').forEach((m) => m.remove()); route(); });
+route();
+</script>
+</body>
+</html>

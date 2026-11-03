@@ -1,0 +1,51 @@
+// End-to-end journey against the web build at iPhone size (Playwright). Reseed the API first: `npm run seed` in the repo root.
+const { chromium, devices } = require('playwright');
+const API = process.env.API_URL || 'http://localhost:3000/api';
+const APP = process.env.APP_URL || 'http://localhost:8081/';
+const OUT = process.env.OUT_DIR || 'e2e-shots';
+require('fs').mkdirSync(OUT, { recursive: true });
+async function call(m, p, b, t) { const r = await fetch(API + p, { method: m, headers: { 'content-type': 'application/json', ...(t ? { authorization: 'Bearer ' + t } : {}) }, body: b ? JSON.stringify(b) : undefined }); return r.json(); }
+(async () => {
+  const b = await chromium.launch();
+  const ctx = await b.newContext({ ...devices['iPhone 14'] });
+  const p = await ctx.newPage(); const errs = [];
+  p.on('pageerror', (e) => errs.push(e.message)); p.on('console', (m) => m.type() === 'error' && errs.push('console: ' + m.text()));
+  const shot = (n) => p.screenshot({ path: `${OUT}/${n}.png` });
+  const wait = (ms = 700) => p.waitForTimeout(ms);
+  const tap = (name) => p.getByRole('button', { name, exact: true }).first().click();
+  await p.goto(APP); await wait(1500); await shot('01-sign-in');
+  await p.getByRole('tab', { name: 'Create account' }).click(); await wait(300);
+  await p.getByLabel('Name', { exact: true }).fill('Riley Mobile');
+  await p.getByLabel('Email', { exact: true }).fill('riley@demo.test');
+  await p.getByLabel('Password (8+ characters)').fill('password123');
+  await tap('Create account'); await wait(1500); await shot('02-pools-unverified');
+  await p.getByText('Verify your identity to add funds', { exact: false }).click(); await wait(800);
+  await p.getByLabel('Date of birth').fill('1994-03-21'); await p.getByLabel('ID document number').fill('M1234567');
+  await tap('Verify me'); await wait(1500); await shot('02b-after-verify');
+  await p.getByRole('tab', { name: /Wallet/ }).click(); await wait(1000);
+  await p.getByLabel('Amount').first().fill('25.00');
+  await p.getByRole('button', { name: /^Add USD/ }).click(); await wait(1500); await shot('03-wallet-funded');
+  await p.getByRole('tab', { name: /Pools/ }).click(); await wait(1000); await shot('04-pools');
+  await p.getByRole('button', { name: /Harbor vs Northgate/ }).first().click(); await wait(1200); await shot('05-pool-detail');
+  await p.getByRole('radio', { name: /^Harbor City FC/ }).click(); await wait(300);
+  await tap('Review entry'); await wait(900); await shot('06-confirm-sheet');
+  await p.getByRole('checkbox').click(); await p.getByRole('button', { name: /^Lock / }).click(); await wait(1800); await shot('07-receipt');
+  // Operations completes the pool via the API (normally done in the ops portal).
+  const pools = await call('GET', '/pools'); const pool = pools.find((x) => x.name.startsWith('Harbor'));
+  const { code } = await call('GET', '/demo/totp/ops@demo.test');
+  const { token } = await call('POST', '/admin/auth/login', { email: 'ops@demo.test', password: 'demo-password', totpCode: code });
+  await call('POST', `/admin/events/${pool.event.id}/feed-result`, { outcomeType: 'WINNER', winningCode: 'HOME', isFinal: true }, token);
+  await call('POST', `/admin/events/${pool.event.id}/ingest-result`, null, token);
+  await call('POST', `/admin/pools/${pool.id}/confirm-result`, null, token);
+  await call('POST', `/admin/pools/${pool.id}/settle`, null, token);
+  await tap('Done'); await wait(800); await p.getByRole('button', { name: 'Back' }).last().click(); await wait(800);
+  await p.getByRole('tab', { name: /My entries/ }).click(); await wait(1200); await shot('08-entries');
+  await p.getByRole('button', { name: /Harbor vs Northgate/ }).first().click(); await wait(1200); await shot('09-statement');
+  await p.getByRole('button', { name: 'Back' }).click(); await wait(500);
+  await p.getByRole('tab', { name: /Wallet/ }).click(); await wait(1000);
+  await tap('Withdraw'); await wait(3500); await shot('10-wallet-withdrawn');
+  await p.getByRole('tab', { name: /Account/ }).click(); await wait(800); await shot('11-account');
+  const me = await p.evaluate(() => document.body.innerText.includes('Verified'));
+  console.log('verified shown:', me); console.log(errs.length ? errs.join('\n') : 'NO JS ERRORS');
+  await b.close();
+})().catch((e) => { console.error(e.message.split('\n').slice(0, 6).join('\n')); process.exit(1); });

@@ -1,0 +1,25 @@
+{
+  "name": "predictpool-mvp",
+  "version": "1.0.0",
+  "description": "Refundable-deposit match & tournament prediction pools — MVP with simulated funds",
+  "scripts": {
+    "start": "node src/server.js",
+    "worker": "node src/worker.js",
+    "seed": "node scripts/seed.js",
+    "demo": "node scripts/demo.js",
+    "test": "node --test --test-concurrency=1 'test/*.test.js'",
+    "db:check": "node scripts/db-check.js",
+    "db:migrate": "node scripts/db-migrate.js",
+    "admin:create": "node scripts/create-admin.js"
+  },
+  "author": "",
+  "license": "UNLICENSED",
+  "dependencies": {
+    "express": "^4.22.3",
+    "pg": "^8.23.1"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "private": true
+}
